@@ -131,6 +131,7 @@ where
             Err(_elapsed) => continue,
         };
         writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
         moved.fetch_add(n as u64, Ordering::Relaxed);
         activity.touch();
     }
@@ -143,6 +144,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{ready, Context, Poll};
     use tokio::io::duplex;
 
     const IDLE: Duration = Duration::from_secs(5);
@@ -275,5 +278,93 @@ mod tests {
         result.expect("relay ends cleanly");
         assert_eq!(meter.to_client(), 30);
         assert_eq!(meter.to_server(), 11);
+    }
+
+    /// Accepts a write but delivers it only on flush, as TLS does when the
+    /// socket under it is full.
+    struct HoldsUntilFlush {
+        inner: tokio::io::DuplexStream,
+        held: Vec<u8>,
+    }
+
+    impl HoldsUntilFlush {
+        fn new(inner: tokio::io::DuplexStream) -> Self {
+            Self {
+                inner,
+                held: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for HoldsUntilFlush {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for HoldsUntilFlush {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.held.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            while !this.held.is_empty() {
+                let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.held))?;
+                this.held.drain(..n);
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            ready!(self.as_mut().poll_flush(cx))?;
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A message must arrive without the sender writing again: a peer waiting
+    /// for its answer has nothing more to send.
+    #[tokio::test(start_paused = true)]
+    async fn delivers_each_write_without_a_later_one() {
+        let (client_near, mut client_far, server_near, mut server_far) = pipes();
+        let mut client_near = HoldsUntilFlush::new(client_near);
+        let mut server_near = HoldsUntilFlush::new(server_near);
+        let meter = Meter::default();
+
+        let relayed = async { relay(&mut client_near, &mut server_near, IDLE, &meter).await };
+        let traffic = async {
+            client_far.write_all(b"request").await.unwrap();
+            let mut buf = [0u8; 7];
+            tokio::time::timeout(IDLE / 2, server_far.read_exact(&mut buf))
+                .await
+                .expect("request held back from the server")
+                .unwrap();
+            assert_eq!(&buf, b"request");
+
+            server_far.write_all(b"response").await.unwrap();
+            let mut buf = [0u8; 8];
+            tokio::time::timeout(IDLE / 2, client_far.read_exact(&mut buf))
+                .await
+                .expect("response held back from the client")
+                .unwrap();
+            assert_eq!(&buf, b"response");
+
+            client_far.shutdown().await.unwrap();
+            server_far.shutdown().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(relayed, traffic);
+        result.expect("relay ends cleanly");
     }
 }
